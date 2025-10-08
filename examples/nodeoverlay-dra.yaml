@@ -1,0 +1,214 @@
+---
+# Example NodeOverlay with DRA Resources
+# This defines GPU resources available for specific instance types
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: gpu-a100-overlay
+spec:
+  # Weight determines priority when multiple overlays match
+  weight: 100
+
+  # Requirements constrain when this overlay applies
+  # This example applies to any node with instance types g5.xlarge or g5.2xlarge
+  requirements:
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values:
+        - g5.xlarge
+        - g5.2xlarge
+
+  # DRA Resources define the device capacity for each instance type
+  draResources:
+    # Configuration for g5.xlarge: 1x NVIDIA A100 GPU
+    - instanceType: g5.xlarge
+      resourceSlices:
+        - driver: gpu.nvidia.com
+          pool:
+            name: a100-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: gpu-0
+              capacity:
+                memory:
+                  value: "40Gi"
+              attributes:
+                model:
+                  string: "A100"
+                compute-capability:
+                  string: "8.0"
+
+    # Configuration for g5.2xlarge: 2x NVIDIA A100 GPUs
+    - instanceType: g5.2xlarge
+      resourceSlices:
+        - driver: gpu.nvidia.com
+          pool:
+            name: a100-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: gpu-0
+              capacity:
+                memory:
+                  value: "40Gi"
+              attributes:
+                model:
+                  string: "A100"
+                compute-capability:
+                  string: "8.0"
+            - name: gpu-1
+              capacity:
+                memory:
+                  value: "40Gi"
+              attributes:
+                model:
+                  string: "A100"
+                compute-capability:
+                  string: "8.0"
+
+---
+# Another example: FPGA resources for specific instance types
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: fpga-overlay
+spec:
+  weight: 90
+
+  requirements:
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values:
+        - f1.2xlarge
+        - f1.4xlarge
+
+  draResources:
+    # Configuration for f1.2xlarge: 1x Xilinx FPGA
+    - instanceType: f1.2xlarge
+      resourceSlices:
+        - driver: fpga.xilinx.com
+          pool:
+            name: fpga-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: fpga-0
+              capacity:
+                logic-cells:
+                  value: "2500000"
+                memory:
+                  value: "64Gi"
+              attributes:
+                family:
+                  string: "Virtex UltraScale+"
+                speed-grade:
+                  int: 2
+
+    # Configuration for f1.4xlarge: 2x Xilinx FPGAs
+    - instanceType: f1.4xlarge
+      resourceSlices:
+        - driver: fpga.xilinx.com
+          pool:
+            name: fpga-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: fpga-0
+              capacity:
+                logic-cells:
+                  value: "2500000"
+                memory:
+                  value: "64Gi"
+              attributes:
+                family:
+                  string: "Virtex UltraScale+"
+                speed-grade:
+                  int: 2
+            - name: fpga-1
+              capacity:
+                logic-cells:
+                  value: "2500000"
+                memory:
+                  value: "64Gi"
+              attributes:
+                family:
+                  string: "Virtex UltraScale+"
+                speed-grade:
+                  int: 2
+
+---
+# Example: Multiple device types on same instance
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: mixed-accelerator-overlay
+spec:
+  weight: 80
+
+  requirements:
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values:
+        - p4d.24xlarge
+
+  draResources:
+    # p4d.24xlarge has both GPUs and network accelerators
+    - instanceType: p4d.24xlarge
+      resourceSlices:
+        # GPU pool
+        - driver: gpu.nvidia.com
+          pool:
+            name: gpu-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: gpu-0
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-1
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-2
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-3
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-4
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-5
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-6
+              capacity:
+                memory:
+                  value: "40Gi"
+            - name: gpu-7
+              capacity:
+                memory:
+                  value: "40Gi"
+
+        # Network accelerator pool
+        - driver: network.aws.com
+          pool:
+            name: efa-pool
+            generation: 1
+            resourceSliceCount: 1
+          devices:
+            - name: efa-0
+              capacity:
+                bandwidth:
+                  value: "400Gi"  # 400 Gbps
+              attributes:
+                type:
+                  string: "EFA"
+                version:
+                  string: "1.0"

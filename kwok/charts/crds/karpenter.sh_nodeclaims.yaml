@@ -197,6 +197,13 @@ spec:
                       description: Requests describes the minimum required resources for the NodeClaim to launch
                       type: object
                   type: object
+                resourceSlices:
+                  description: ResourceSlices enumerate device-level capacities backing the NodeClaim for Dynamic Resource Allocation integrations.
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  type: array
+                  x-kubernetes-list-type: atomic
                 startupTaints:
                   description: |-
                     StartupTaints are taints that are applied to nodes upon startup which are expected to be removed automatically

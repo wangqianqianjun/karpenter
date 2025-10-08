@@ -25,7 +25,9 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -57,6 +59,10 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+
+	// DRA (Dynamic Resource Allocation) support
+	draManager   *DRAResourceManager
+	draValidator *scheduling.DRAValidator
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -88,6 +94,8 @@ func NewNodeClaim(
 	instanceTypes []*cloudprovider.InstanceType,
 	reservationManager *ReservationManager,
 	reservedOfferingMode ReservedOfferingMode,
+	draManager *DRAResourceManager,
+	draValidator *scheduling.DRAValidator,
 ) *NodeClaim {
 	hostname := fmt.Sprintf("hostname-placeholder-%04d", atomic.AddInt64(&nodeID, 1))
 	template := *nodeClaimTemplate
@@ -105,7 +113,107 @@ func NewNodeClaim(
 		reservedOfferings:    cloudprovider.Offerings{},
 		reservationManager:   reservationManager,
 		reservedOfferingMode: reservedOfferingMode,
+		draManager:           draManager,
+		draValidator:         draValidator,
 	}
+}
+
+// createPlaceholderNode creates a temporary node object for DRA validation simulation.
+// This placeholder node is used to validate DRA requirements against instance types that don't
+// have actual nodes yet. It includes the instance type label and copies relevant labels from
+// the NodeClaimTemplate to ensure proper DRA validation (e.g., NodeSelector matching).
+func (n *NodeClaim) createPlaceholderNode(instanceType *cloudprovider.InstanceType) *corev1.Node {
+	labels := make(map[string]string)
+
+	// Add instance type label (required for DRA validation)
+	labels[corev1.LabelInstanceTypeStable] = instanceType.Name
+
+	// Copy labels from NodeClaimTemplate that might be relevant for DRA NodeSelector matching
+	// This includes zone, region, architecture, OS, and any custom labels
+	for k, v := range n.Labels {
+		labels[k] = v
+	}
+
+	// Copy requirements that can be represented as labels
+	// This ensures NodeSelector matching works correctly in DRA validation
+	for _, req := range n.Requirements.Values() {
+		if req.Operator() == corev1.NodeSelectorOpIn && req.Len() == 1 {
+			// Only add single-value In requirements as labels
+			values := req.Values()
+			if len(values) > 0 {
+				labels[req.Key] = values[0]
+			}
+		}
+	}
+
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   fmt.Sprintf("karpenter-placeholder-%s-%s", instanceType.Name, n.hostname),
+			Labels: labels,
+		},
+	}
+}
+
+// filterInstanceTypesByDRA filters instance types based on DRA (Dynamic Resource Allocation) requirements.
+// It checks if each instance type has sufficient device resources to satisfy the pod's ResourceClaims,
+// considering the resources already allocated to existing pods on the NodeClaim.
+func (n *NodeClaim) filterInstanceTypesByDRA(
+	ctx context.Context,
+	instanceTypes []*cloudprovider.InstanceType,
+	pod *corev1.Pod,
+) ([]*cloudprovider.InstanceType, error) {
+	// If no DRA components or pod has no resource claims, return all instance types
+	if n.draManager == nil || n.draValidator == nil || len(pod.Spec.ResourceClaims) == 0 {
+		return instanceTypes, nil
+	}
+
+	// Get resource claims for the new pod
+	newPodClaims, err := n.draValidator.GetPodResourceClaims(ctx, pod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get resource claims for pod: %w", err)
+	}
+
+	// Get existing resource claims from all pods already scheduled on this NodeClaim
+	var existingClaims []*resourcev1.ResourceClaim
+	for _, existingPod := range n.Pods {
+		podClaims, err := n.draValidator.GetPodResourceClaims(ctx, existingPod)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get resource claims for existing pod %s: %w", existingPod.Name, err)
+		}
+		existingClaims = append(existingClaims, podClaims.Claims...)
+	}
+
+	// Filter instance types by DRA capability
+	compatible := make([]*cloudprovider.InstanceType, 0, len(instanceTypes))
+	for _, it := range instanceTypes {
+		// Get ResourceSlices for this instance type from DRA manager
+		resourceSlices := n.draManager.GetResourceSlices(it.Name)
+
+		// Create a placeholder node for DRA validation simulation
+		// This is necessary because DRA allocator needs node information for:
+		// - NodeSelector matching in ResourceSlice selection
+		// - PerDeviceNodeSelection validation
+		// - Generating proper AllocationResult.NodeSelector
+		placeholderNode := n.createPlaceholderNode(it)
+
+		// Validate if this instance type can accommodate both existing and new claims
+		canSchedule, err := n.draValidator.CanScheduleWithDRA(
+			ctx,
+			existingClaims,
+			newPodClaims.Claims,
+			resourceSlices,
+			placeholderNode, // Use placeholder node avoid dra validation failed
+		)
+		if err != nil {
+			return nil, fmt.Errorf("DRA validation failed for instance type %s: %w", it.Name, err)
+		}
+
+		if canSchedule {
+			compatible = append(compatible, it)
+		}
+	}
+
+	return compatible, nil
 }
 
 // CanAdd returns whether the pod can be added to the NodeClaim
@@ -155,6 +263,18 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 		// due to calls to resources.Merge and stringifying the nodeClaimRequirements
 		return nil, nil, nil, err
 	}
+
+	// Filter by DRA (Dynamic Resource Allocation) requirements if pod has resource claims
+	if len(pod.Spec.ResourceClaims) > 0 {
+		remaining, err = n.filterInstanceTypesByDRA(ctx, remaining, pod)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("filtering instance types by DRA, %w", err)
+		}
+		if len(remaining) == 0 {
+			return nil, nil, nil, fmt.Errorf("no instance types satisfy DRA requirements")
+		}
+	}
+
 	ofs, err := n.offeringsToReserve(ctx, remaining, nodeClaimRequirements)
 	if err != nil {
 		return nil, nil, nil, err

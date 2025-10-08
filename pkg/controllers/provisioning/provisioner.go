@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	scheduler "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -275,7 +276,14 @@ func (p *Provisioner) NewScheduler(
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, opts...), nil
+
+	// Get NodeOverlays
+	nodeOverlays, err := p.getNodeOverlays(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting node overlays, %w", err)
+	}
+
+	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, nodeOverlays, opts...), nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
@@ -480,8 +488,22 @@ func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, erro
 
 	// Add other daemon pods from cluster state (high performance, no API calls)
 	otherDaemonPods := p.cluster.GetOtherDaemonPods()
-	
+
 	return append(daemonPods, otherDaemonPods...), nil
+}
+
+func (p *Provisioner) getNodeOverlays(ctx context.Context) ([]*v1alpha1.NodeOverlay, error) {
+	nodeOverlayList := &v1alpha1.NodeOverlayList{}
+	if err := p.kubeClient.List(ctx, nodeOverlayList); err != nil {
+		return nil, fmt.Errorf("listing node overlays, %w", err)
+	}
+
+	// Filter out node overlays that are being deleted or not ready
+	nodeOverlays := lo.Filter(nodeOverlayList.Items, func(overlay v1alpha1.NodeOverlay, _ int) bool {
+		return overlay.DeletionTimestamp.IsZero()
+	})
+
+	return lo.ToSlicePtr(nodeOverlays), nil
 }
 
 func (p *Provisioner) Validate(ctx context.Context, pod *corev1.Pod) error {

@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -124,6 +125,7 @@ func NewScheduler(
 	daemonSetPods []*corev1.Pod,
 	recorder events.Recorder,
 	clock clock.Clock,
+	nodeOverlays []*v1alpha1.NodeOverlay,
 	opts ...Options,
 ) *Scheduler {
 	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
@@ -156,6 +158,11 @@ func NewScheduler(
 		}
 		return nct, true
 	})
+	// Initialize DRA (Dynamic Resource Allocation) support
+	draManager := NewDRAResourceManager()
+	draManager.BuildCache(nodeOverlays)
+	draValidator := scheduling.NewDRAValidator(kubeClient)
+
 	s := &Scheduler{
 		uuid:                uuid.NewUUID(),
 		kubeClient:          kubeClient,
@@ -176,6 +183,8 @@ func NewScheduler(
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		draManager:              draManager,
+		draValidator:            draValidator,
 	}
 	s.calculateExistingNodeClaims(stateNodes, daemonSetPods)
 	return s
@@ -207,6 +216,9 @@ type Scheduler struct {
 	preferencePolicy        PreferencePolicy
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
+	// DRA (Dynamic Resource Allocation) support
+	draManager   *DRAResourceManager
+	draValidator *scheduling.DRAValidator
 }
 
 // Results contains the results of the scheduling operation
@@ -483,7 +495,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, pod *corev1.Pod) erro
 		return err
 	}
 	parallelizeUntil(s.numConcurrentReconciles, len(s.existingNodes), func(i int) bool {
-		r, err := s.existingNodes[i].CanAdd(pod, s.cachedPodData[pod.UID], volumes)
+		r, err := s.existingNodes[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], volumes)
 		if err == nil {
 			mu.Lock()
 			defer mu.Unlock()
@@ -570,7 +582,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 				))
 			}
 		}
-		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverhead[s.nodeClaimTemplates[i]], s.daemonHostPortUsage[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverhead[s.nodeClaimTemplates[i]], s.daemonHostPortUsage[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode, s.draManager, s.draValidator)
 		r, its, ofs, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
 		if err != nil {
 			errs[i] = err
@@ -647,7 +659,7 @@ func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, d
 			}
 			daemons = append(daemons, p)
 		}
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...)))
+		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.draManager, s.draValidator))
 
 		// We don't use the status field and instead recompute the remaining resources to ensure we have a consistent view
 		// of the cluster during scheduling.  Depending on how node creation falls out, this will also work for cases where

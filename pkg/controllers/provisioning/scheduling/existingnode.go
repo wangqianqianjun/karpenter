@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
@@ -35,9 +36,13 @@ type ExistingNode struct {
 	topology           *Topology
 	remainingResources v1.ResourceList
 	requirements       scheduling.Requirements
+
+	// DRA (Dynamic Resource Allocation) support
+	draManager   *DRAResourceManager
+	draValidator *scheduling.DRAValidator
 }
 
-func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList) *ExistingNode {
+func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, draManager *DRAResourceManager, draValidator *scheduling.DRAValidator) *ExistingNode {
 	// The state node passed in here must be a deep copy from cluster state as we modify it
 	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
 	resources.SubtractFrom(daemonResources, n.DaemonSetRequests())
@@ -58,6 +63,8 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		topology:           topology,
 		remainingResources: resources.Subtract(available, daemonResources),
 		requirements:       scheduling.NewLabelRequirements(n.Labels()),
+		draManager:         draManager,
+		draValidator:       draValidator,
 	}
 	node.requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
 	topology.Register(v1.LabelHostname, n.HostName())
@@ -66,8 +73,8 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 
 // CanAdd returns whether the pod can be added to the ExistingNode
 // based on the taints/tolerations, volume requirements, host port compatibility,
-// requirements, resources, and topology requirements
-func (n *ExistingNode) CanAdd(pod *v1.Pod, podData *PodData, volumes scheduling.Volumes) (updatedRequirements scheduling.Requirements, err error) {
+// requirements, resources, DRA requirements, and topology requirements
+func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData, volumes scheduling.Volumes) (updatedRequirements scheduling.Requirements, err error) {
 	// Check Taints
 	if err := scheduling.Taints(n.cachedTaints).ToleratesPod(pod); err != nil {
 		return nil, err
@@ -103,6 +110,21 @@ func (n *ExistingNode) CanAdd(pod *v1.Pod, podData *PodData, volumes scheduling.
 		return nil, err
 	}
 	nodeRequirements.Add(topologyRequirements.Values()...)
+
+	// Check DRA (Dynamic Resource Allocation) requirements if pod has resource claims
+	if n.draManager != nil && n.draValidator != nil {
+		// Get instance type from node labels
+		instanceType := n.Labels()[v1.LabelInstanceTypeStable]
+		if instanceType == "" && len(pod.Spec.ResourceClaims) > 0 {
+			return nil, fmt.Errorf("node missing instance-type label")
+		}
+
+		// Validate DRA requirements using the high-level helper
+		if err := n.draValidator.ValidateNodeForPod(ctx, pod, n.Pods, instanceType, n.Node, n.draManager); err != nil {
+			return nil, err
+		}
+	}
+
 	return nodeRequirements, nil
 }
 

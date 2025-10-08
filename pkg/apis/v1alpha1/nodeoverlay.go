@@ -23,6 +23,7 @@ import (
 
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -61,6 +62,26 @@ type NodeOverlaySpec struct {
 	// +kubebuilder:validation:Maximum:=10000
 	// +optional
 	Weight *int32 `json:"weight,omitempty"`
+	// DRAResources defines the DRA (Dynamic Resource Allocation) resources available for specific instance types.
+	// This field enables Karpenter to simulate DRA scheduling during bin-packing by mapping
+	// instance types to their available device resources (e.g., GPUs, FPGAs).
+	// +optional
+	// +listType=atomic
+	DRAResources []DRAResource `json:"draResources,omitempty"`
+}
+
+// DRAResource defines the DRA resource slices available for a specific instance type.
+// Each DRAResource represents the device capacity for one instance type.
+type DRAResource struct {
+	// InstanceType specifies the instance type name (e.g., "g5.xlarge", "p4d.24xlarge")
+	// that this DRA resource configuration applies to.
+	// +required
+	InstanceType string `json:"instanceType"`
+	// ResourceSlices defines the resource slices available on this instance type.
+	// Each ResourceSlice represents a pool of devices with their capacities and attributes.
+	// +optional
+	// +listType=atomic
+	ResourceSlices []resourcev1.ResourceSliceSpec `json:"resourceSlices,omitempty"`
 }
 
 // +kubebuilder:object:root=true
