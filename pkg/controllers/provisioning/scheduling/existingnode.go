@@ -119,9 +119,14 @@ func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData
 			return nil, fmt.Errorf("node missing instance-type label")
 		}
 
-		// Validate DRA requirements using the high-level helper
-		if err := n.draValidator.ValidateNodeForPod(ctx, pod, n.Pods, instanceType, n.Node, n.draManager); err != nil {
+		// Validate DRA requirements using SchedulePodWithDRA
+		// For existing nodes, pass nil for cachedResults
+		canSchedule, _, err := n.draValidator.SchedulePodWithDRA(ctx, pod, n.Pods, nil, instanceType, n.Node, n.draManager)
+		if err != nil {
 			return nil, err
+		}
+		if !canSchedule {
+			return nil, fmt.Errorf("DRA validation failed")
 		}
 	}
 

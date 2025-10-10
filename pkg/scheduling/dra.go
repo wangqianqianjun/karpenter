@@ -48,6 +48,16 @@ func NewDRAValidator(kubeClient client.Client) *DRAValidator {
 	}
 }
 
+// KubeClient returns the Kubernetes client for API access
+func (v *DRAValidator) KubeClient() client.Client {
+	return v.kubeClient
+}
+
+// CELCache returns the CEL expression cache
+func (v *DRAValidator) CELCache() *dracel.Cache {
+	return v.celCache
+}
+
 // PodResourceClaims represents the resolved resource claims for a pod
 type PodResourceClaims struct {
 	Claims []*resourcev1.ResourceClaim
@@ -109,32 +119,23 @@ func (v *DRAValidator) GetPodResourceClaims(ctx context.Context, pod *corev1.Pod
 	return result, nil
 }
 
-// CanScheduleWithDRA validates whether a pod with resource claims can be scheduled
-// on a node with the given resource slices using the official DRA allocator.
-//
-// This method creates a DRA allocator with the available resource slices and attempts
-// to allocate the claims. If allocation succeeds, the pod can be scheduled.
-//
-// Parameters:
-//   - existingClaims: resource claims already allocated on the node
-//   - newClaims: resource claims from the pod being scheduled
-//   - resourceSlices: available device capacity on the instance type
-//   - node: simulated node (can be nil for new nodes, will create a placeholder)
-func (v *DRAValidator) CanScheduleWithDRA(
+// allocateWithState is the core DRA allocation logic that validates whether new claims can be scheduled
+// given a pre-computed AllocatedState. This is a private helper used by both legacy and cache-based paths.
+func (v *DRAValidator) allocateWithState(
 	ctx context.Context,
-	existingClaims []*resourcev1.ResourceClaim,
+	allocatedState structured.AllocatedState,
 	newClaims []*resourcev1.ResourceClaim,
 	resourceSlices []resourcev1.ResourceSliceSpec,
 	node *corev1.Node,
-) (bool, error) {
+) (bool, []resourcev1.AllocationResult, error) {
 	// If no new claims, always succeed
 	if len(newClaims) == 0 {
-		return true, nil
+		return true, nil, nil
 	}
 
 	// If no resource slices defined but claims exist, cannot schedule
 	if len(resourceSlices) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 
 	// Create a placeholder node if not provided
@@ -149,32 +150,20 @@ func (v *DRAValidator) CanScheduleWithDRA(
 		slice := &resourcev1.ResourceSlice{
 			Spec: spec,
 		}
-		// Set a synthetic name for the slice
 		slice.Name = fmt.Sprintf("slice-%d", i)
 		slices = append(slices, slice)
 	}
 
-	// Build allocated state from existing claims
-	allocatedState := buildAllocatedState(existingClaims)
-
-	// Create a DeviceClassLister that fetches from the API server
-	classLister := &kubeDeviceClassLister{
-		client: v.kubeClient,
-		ctx:    ctx,
+	// Create a DeviceClassLister
+	classLister := &KubeDeviceClassLister{
+		Client: v.kubeClient,
+		Ctx:    ctx,
 	}
 
-	// Use all supported features for maximum compatibility
-	features := structured.Features{
-		AdminAccess:          true,
-		PrioritizedList:      true,
-		PartitionableDevices: true,
-		DeviceTaints:         true,
-		DeviceBinding:        true,
-		DeviceStatus:         true,
-		ConsumableCapacity:   true,
-	}
+	// Use all supported features
+	features := GetDRAFeatures()
 
-	// Create allocator with official DRA library
+	// Create allocator with the provided AllocatedState
 	allocator, err := structured.NewAllocator(
 		ctx,
 		features,
@@ -184,45 +173,166 @@ func (v *DRAValidator) CanScheduleWithDRA(
 		v.celCache,
 	)
 	if err != nil {
-		return false, fmt.Errorf("failed to create DRA allocator: %w", err)
+		return false, nil, fmt.Errorf("failed to create DRA allocator: %w", err)
 	}
 
 	// Try to allocate all new claims
 	results, err := allocator.Allocate(ctx, node, newClaims)
 	if err != nil {
-		// Allocation failed due to error - propagate the error for visibility
-		// This could be due to configuration issues (CEL errors, missing DeviceClass, etc.)
-		log.FromContext(ctx).WithValues("node", node.Name, "newClaimsCount", len(newClaims), "existingClaimsCount", len(existingClaims), "resourceSlicesCount", len(resourceSlices)).V(1).Info(fmt.Sprintf("DRA allocator failed, %s", err))
-		return false, fmt.Errorf("DRA allocator failed: %w", err)
+		log.FromContext(ctx).WithValues("node", node.Name, "newClaimsCount", len(newClaims)).V(1).Info(fmt.Sprintf("DRA allocator failed, %s", err))
+		return false, nil, fmt.Errorf("DRA allocator failed: %w", err)
 	}
 
 	// Check if all claims were allocated
 	if len(results) != len(newClaims) {
-		// Some claims could not be allocated - insufficient device capacity
-		log.FromContext(ctx).WithValues("node", node.Name, "requestedClaims", len(newClaims), "allocatedClaims", len(results), "existingClaims", len(existingClaims)).V(1).Info("DRA allocation incomplete")
-		return false, nil
+		log.FromContext(ctx).WithValues("node", node.Name, "requestedClaims", len(newClaims), "allocatedClaims", len(results)).V(1).Info("DRA allocation incomplete")
+		return false, nil, nil
 	}
 
-	// Log successful allocation for debugging
-	log.FromContext(ctx).WithValues("node", node.Name, "allocatedClaims", len(results), "existingClaims", len(existingClaims)).V(2).Info("DRA allocation successful")
-
-	return true, nil
+	log.FromContext(ctx).WithValues("node", node.Name, "allocatedClaims", len(results)).V(2).Info("DRA allocation successful")
+	return true, results, nil
 }
 
-// ValidateNodeForPod is a high-level helper that encapsulates the full DRA validation workflow
-// for scheduling a pod to an existing node. It collects existing claims, retrieves resource slices,
-// and performs DRA validation.
+// CanScheduleWithDRA validates whether a pod with resource claims can be scheduled
+// on a node with the given resource slices using the official DRA allocator.
+//
+// This unified method handles both existing nodes and inflight NodeClaims:
+// 1. For existing nodes: build AllocatedState from ResourceClaim.Status.Allocation
+// 2. For inflight NodeClaims: build AllocatedState from cached allocation results
+// 3. Merge both sources if both are provided
+//
+// Parameters:
+//   - existingClaims: resource claims already allocated on the node (from Status.Allocation)
+//   - cachedResults: map of pod -> cached allocation results (for inflight NodeClaims)
+//   - existingPods: pods already scheduled (needed when using cachedResults)
+//   - newClaims: resource claims from the pod being scheduled
+//   - resourceSlices: available device capacity on the instance type
+//   - node: simulated node (can be nil for new nodes, will create a placeholder)
+//
+// Returns:
+//   - canSchedule: whether the pod can be scheduled
+//   - allocationResults: allocation results for the new pod (to be cached)
+//   - error: any error encountered
+func (v *DRAValidator) CanScheduleWithDRA(
+	ctx context.Context,
+	existingClaims []*resourcev1.ResourceClaim,
+	cachedResults map[*corev1.Pod][]resourcev1.AllocationResult,
+	existingPods []*corev1.Pod,
+	newClaims []*resourcev1.ResourceClaim,
+	resourceSlices []resourcev1.ResourceSliceSpec,
+	node *corev1.Node,
+) (bool, []resourcev1.AllocationResult, error) {
+	// Start with AllocatedState from existing claims (for existing nodes)
+	// This will be empty if existingClaims is nil/empty (for inflight NodeClaims)
+	allocatedState := buildAllocatedState(existingClaims)
+
+	// If we have cached results (inflight NodeClaim scenario), merge them into AllocatedState
+	// This ensures allocation stability - cached results take precedence
+	if cachedResults != nil && len(existingPods) > 0 {
+		for _, existingPod := range existingPods {
+			if results, ok := cachedResults[existingPod]; ok {
+				// Use cached allocation results - DON'T re-allocate
+				podClaims, err := v.GetPodResourceClaims(ctx, existingPod)
+				if err != nil {
+					return false, nil, fmt.Errorf("failed to get resource claims for existing pod %s: %w", existingPod.Name, err)
+				}
+
+				if len(podClaims.Claims) > 0 {
+					// Update allocated state with cached results
+					allocatedState = UpdateAllocatedStateFromResults(
+						allocatedState,
+						results,
+						podClaims.Claims,
+					)
+				}
+			}
+		}
+	}
+
+	// Use the unified allocation logic
+	return v.allocateWithState(ctx, allocatedState, newClaims, resourceSlices, node)
+}
+
+// SchedulePodWithDRA is a high-level helper that encapsulates the full DRA validation workflow
+// for scheduling a pod to either an existing node or an inflight NodeClaim.
+//
+// This unified method supports two scenarios:
+// 1. Existing nodes: Uses existingClaims from ResourceClaim.Status.Allocation
+// 2. Inflight NodeClaims: Uses cachedResults from previous allocations
 //
 // Parameters:
 //   - ctx: context for API calls and logging
 //   - newPod: the pod being scheduled
-//   - existingPods: pods already scheduled on the node
+//   - existingPods: pods already scheduled on the node/NodeClaim
+//   - cachedResults: cached allocation results (for inflight NodeClaims, nil for existing nodes)
 //   - instanceType: the instance type of the node
 //   - node: the actual node object (can be nil for simulation)
 //   - draManager: manager for looking up ResourceSlices by instance type
 //
 // Returns:
-//   - error if validation fails or if there's a configuration issue
+//   - canSchedule: true if the pod can be scheduled
+//   - allocationResults: the allocation results for the new pod (for caching)
+//   - error: if there's a configuration issue or API failure
+func (v *DRAValidator) SchedulePodWithDRA(
+	ctx context.Context,
+	newPod *corev1.Pod,
+	existingPods []*corev1.Pod,
+	cachedResults map[*corev1.Pod][]resourcev1.AllocationResult,
+	instanceType string,
+	node *corev1.Node,
+	draManager interface {
+		GetResourceSlices(instanceType string) []resourcev1.ResourceSliceSpec
+	},
+) (bool, []resourcev1.AllocationResult, error) {
+	// Check if pod has resource claims
+	if len(newPod.Spec.ResourceClaims) == 0 {
+		return true, nil, nil
+	}
+
+	// Get resource claims for the new pod
+	newPodClaims, err := v.GetPodResourceClaims(ctx, newPod)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to get resource claims for pod: %w", err)
+	}
+
+	// Get ResourceSlices for this instance type
+	resourceSlices := draManager.GetResourceSlices(instanceType)
+
+	// For existing nodes: collect existingClaims from Status.Allocation
+	// For inflight NodeClaims: existingClaims will be nil, use cachedResults instead
+	var existingClaims []*resourcev1.ResourceClaim
+	if cachedResults == nil {
+		// Existing node scenario: collect claims from all existing pods
+		for _, existingPod := range existingPods {
+			podClaims, err := v.GetPodResourceClaims(ctx, existingPod)
+			if err != nil {
+				return false, nil, fmt.Errorf("failed to get resource claims for existing pod %s: %w", existingPod.Name, err)
+			}
+			existingClaims = append(existingClaims, podClaims.Claims...)
+		}
+	}
+
+	// Validate if this node can accommodate both existing and new claims
+	canSchedule, allocationResults, err := v.CanScheduleWithDRA(
+		ctx,
+		existingClaims,  // nil for inflight NodeClaims, populated for existing nodes
+		cachedResults,   // nil for existing nodes, populated for inflight NodeClaims
+		existingPods,    // used when cachedResults is not nil
+		newPodClaims.Claims,
+		resourceSlices,
+		node,
+	)
+	if err != nil {
+		return false, nil, fmt.Errorf("DRA validation failed: %w", err)
+	}
+
+	return canSchedule, allocationResults, nil
+}
+
+// ValidateNodeForPod is a backward-compatible wrapper around SchedulePodWithDRA
+// for existing node scenario. It returns an error if validation fails.
+//
+// Deprecated: Use SchedulePodWithDRA for more flexible control.
 func (v *DRAValidator) ValidateNodeForPod(
 	ctx context.Context,
 	newPod *corev1.Pod,
@@ -233,40 +343,17 @@ func (v *DRAValidator) ValidateNodeForPod(
 		GetResourceSlices(instanceType string) []resourcev1.ResourceSliceSpec
 	},
 ) error {
-	// Check if pod has resource claims
-	if len(newPod.Spec.ResourceClaims) == 0 {
-		return nil
-	}
-
-	// Get resource claims for the new pod
-	newPodClaims, err := v.GetPodResourceClaims(ctx, newPod)
-	if err != nil {
-		return fmt.Errorf("failed to get resource claims for pod: %w", err)
-	}
-
-	// Get existing resource claims from all pods already scheduled on this node
-	var existingClaims []*resourcev1.ResourceClaim
-	for _, existingPod := range existingPods {
-		podClaims, err := v.GetPodResourceClaims(ctx, existingPod)
-		if err != nil {
-			return fmt.Errorf("failed to get resource claims for existing pod %s: %w", existingPod.Name, err)
-		}
-		existingClaims = append(existingClaims, podClaims.Claims...)
-	}
-
-	// Get ResourceSlices for this instance type
-	resourceSlices := draManager.GetResourceSlices(instanceType)
-
-	// Validate if this node can accommodate both existing and new claims
-	canSchedule, err := v.CanScheduleWithDRA(
+	canSchedule, _, err := v.SchedulePodWithDRA(
 		ctx,
-		existingClaims,
-		newPodClaims.Claims,
-		resourceSlices,
+		newPod,
+		existingPods,
+		nil,  // cachedResults: nil for existing nodes
+		instanceType,
 		node,
+		draManager,
 	)
 	if err != nil {
-		return fmt.Errorf("DRA validation failed: %w", err)
+		return err
 	}
 
 	if !canSchedule {
@@ -346,15 +433,95 @@ func buildAllocatedState(existingClaims []*resourcev1.ResourceClaim) structured.
 	}
 }
 
-// kubeDeviceClassLister implements DeviceClassLister by querying the Kubernetes API server
-type kubeDeviceClassLister struct {
-	client client.Client
-	ctx    context.Context
+// EmptyAllocatedState creates an empty AllocatedState for initialization
+func EmptyAllocatedState() structured.AllocatedState {
+	return structured.AllocatedState{
+		AllocatedDevices:         sets.New[structured.DeviceID](),
+		AllocatedSharedDeviceIDs: sets.New[structured.SharedDeviceID](),
+		AggregatedCapacity:       structured.NewConsumedCapacityCollection(),
+	}
 }
 
-func (l *kubeDeviceClassLister) List() ([]*resourcev1.DeviceClass, error) {
+// UpdateAllocatedStateFromResults updates AllocatedState by adding allocation results.
+// This is used to maintain state during sequential allocation simulation for inflight NodeClaims.
+func UpdateAllocatedStateFromResults(
+	current structured.AllocatedState,
+	results []resourcev1.AllocationResult,
+	claims []*resourcev1.ResourceClaim,
+) structured.AllocatedState {
+	// Clone current state
+	newAllocatedDevices := current.AllocatedDevices.Clone()
+	newSharedDevices := current.AllocatedSharedDeviceIDs.Clone()
+	newCapacity := cloneConsumedCapacityCollection(current.AggregatedCapacity)
+
+	for i, result := range results {
+		claim := claims[i]
+		shareID := claim.UID
+
+		for _, deviceResult := range result.Devices.Results {
+			deviceID := structured.MakeDeviceID(
+				deviceResult.Driver,
+				deviceResult.Pool,
+				deviceResult.Device,
+			)
+
+			// Add to allocated devices
+			newAllocatedDevices.Insert(deviceID)
+
+			// Add to shared device IDs if we have a UID
+			if shareID != "" {
+				sharedDeviceID := structured.MakeSharedDeviceID(deviceID, &shareID)
+				newSharedDevices.Insert(sharedDeviceID)
+			}
+
+			// Add consumed capacity if present
+			if deviceResult.ConsumedCapacity != nil {
+				capacityMap := make(map[resourcev1.QualifiedName]resource.Quantity)
+				for capName, capQty := range deviceResult.ConsumedCapacity {
+					capacityMap[capName] = capQty.DeepCopy()
+				}
+				deviceCap := structured.NewDeviceConsumedCapacity(deviceID, capacityMap)
+				newCapacity.Insert(deviceCap)
+			}
+		}
+	}
+
+	return structured.AllocatedState{
+		AllocatedDevices:         newAllocatedDevices,
+		AllocatedSharedDeviceIDs: newSharedDevices,
+		AggregatedCapacity:       newCapacity,
+	}
+}
+
+// cloneConsumedCapacityCollection creates a deep copy of ConsumedCapacityCollection
+func cloneConsumedCapacityCollection(
+	collection structured.ConsumedCapacityCollection,
+) structured.ConsumedCapacityCollection {
+	newCollection := structured.NewConsumedCapacityCollection()
+	for deviceID, capacity := range collection {
+		// Clone the capacity map (note: ConsumedCapacity is map[QualifiedName]*Quantity)
+		newCapacityMap := make(map[resourcev1.QualifiedName]*resource.Quantity)
+		for key, qtyPtr := range capacity {
+			if qtyPtr != nil {
+				qtyCopy := qtyPtr.DeepCopy()
+				newCapacityMap[key] = &qtyCopy
+			}
+		}
+		newCollection[deviceID] = newCapacityMap
+	}
+	return newCollection
+}
+
+// KubeDeviceClassLister implements DeviceClassLister by querying the Kubernetes API server.
+// This is exported so it can be used by other packages like nodeclaim.
+type KubeDeviceClassLister struct {
+	Client client.Client
+	Ctx    context.Context
+}
+
+func (l *KubeDeviceClassLister) List() ([]*resourcev1.DeviceClass, error) {
 	var classList resourcev1.DeviceClassList
-	if err := l.client.List(l.ctx, &classList); err != nil {
+	if err := l.Client.List(l.Ctx, &classList); err != nil {
 		return nil, fmt.Errorf("failed to list device classes: %w", err)
 	}
 
@@ -365,10 +532,47 @@ func (l *kubeDeviceClassLister) List() ([]*resourcev1.DeviceClass, error) {
 	return result, nil
 }
 
-func (l *kubeDeviceClassLister) Get(name string) (*resourcev1.DeviceClass, error) {
+func (l *KubeDeviceClassLister) Get(name string) (*resourcev1.DeviceClass, error) {
 	var deviceClass resourcev1.DeviceClass
-	if err := l.client.Get(l.ctx, client.ObjectKey{Name: name}, &deviceClass); err != nil {
+	if err := l.Client.Get(l.Ctx, client.ObjectKey{Name: name}, &deviceClass); err != nil {
 		return nil, fmt.Errorf("failed to get device class %s: %w", name, err)
 	}
 	return &deviceClass, nil
+}
+
+// GetDRAFeatures returns the structured.Features to use for DRA allocation.
+// This enables all supported DRA features for maximum compatibility.
+func GetDRAFeatures() structured.Features {
+	return structured.Features{
+		AdminAccess:          true,
+		PrioritizedList:      true,
+		PartitionableDevices: true,
+		DeviceTaints:         true,
+		DeviceBinding:        true,
+		DeviceStatus:         true,
+		ConsumableCapacity:   true,
+	}
+}
+
+// NewDRAAllocator creates a new DRA allocator using the official Kubernetes library.
+// This is a convenience wrapper to simplify allocator creation.
+func NewDRAAllocator(
+	ctx context.Context,
+	features structured.Features,
+	allocatedState structured.AllocatedState,
+	classLister interface {
+		List() ([]*resourcev1.DeviceClass, error)
+		Get(name string) (*resourcev1.DeviceClass, error)
+	},
+	slices []*resourcev1.ResourceSlice,
+	celCache *dracel.Cache,
+) (structured.Allocator, error) {
+	return structured.NewAllocator(
+		ctx,
+		features,
+		allocatedState,
+		classLister,
+		slices,
+		celCache,
+	)
 }

@@ -63,6 +63,17 @@ type NodeClaim struct {
 	// DRA (Dynamic Resource Allocation) support
 	draManager   *DRAResourceManager
 	draValidator *scheduling.DRAValidator
+
+	// draAllocationResults caches allocation results for each pod scheduled to this NodeClaim.
+	// This ensures allocation stability - once a pod's devices are allocated, they won't change
+	// even if the allocator is called again (which could select different devices).
+	//
+	// Key: pod pointer (stable within a single scheduling cycle)
+	// Value: allocation results for the pod's resource claims
+	//
+	// Lifecycle: Created with NodeClaim, garbage collected when NodeClaim is discarded.
+	// No manual cleanup needed as NodeClaim is a single-use object per scheduling cycle.
+	draAllocationResults map[*corev1.Pod][]resourcev1.AllocationResult
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -115,6 +126,7 @@ func NewNodeClaim(
 		reservedOfferingMode: reservedOfferingMode,
 		draManager:           draManager,
 		draValidator:         draValidator,
+		draAllocationResults: make(map[*corev1.Pod][]resourcev1.AllocationResult),
 	}
 }
 
@@ -157,6 +169,9 @@ func (n *NodeClaim) createPlaceholderNode(instanceType *cloudprovider.InstanceTy
 // filterInstanceTypesByDRA filters instance types based on DRA (Dynamic Resource Allocation) requirements.
 // It checks if each instance type has sufficient device resources to satisfy the pod's ResourceClaims,
 // considering the resources already allocated to existing pods on the NodeClaim.
+//
+// This method uses cached allocation results to ensure allocation stability - once a pod is allocated
+// devices, it always gets the same devices even across multiple CanAdd calls.
 func (n *NodeClaim) filterInstanceTypesByDRA(
 	ctx context.Context,
 	instanceTypes []*cloudprovider.InstanceType,
@@ -167,48 +182,32 @@ func (n *NodeClaim) filterInstanceTypesByDRA(
 		return instanceTypes, nil
 	}
 
-	// Get resource claims for the new pod
-	newPodClaims, err := n.draValidator.GetPodResourceClaims(ctx, pod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get resource claims for pod: %w", err)
-	}
-
-	// Get existing resource claims from all pods already scheduled on this NodeClaim
-	var existingClaims []*resourcev1.ResourceClaim
-	for _, existingPod := range n.Pods {
-		podClaims, err := n.draValidator.GetPodResourceClaims(ctx, existingPod)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get resource claims for existing pod %s: %w", existingPod.Name, err)
-		}
-		existingClaims = append(existingClaims, podClaims.Claims...)
-	}
-
-	// Filter instance types by DRA capability
+	// Filter instance types by DRA capability using cached allocation results
 	compatible := make([]*cloudprovider.InstanceType, 0, len(instanceTypes))
 	for _, it := range instanceTypes {
-		// Get ResourceSlices for this instance type from DRA manager
-		resourceSlices := n.draManager.GetResourceSlices(it.Name)
-
 		// Create a placeholder node for DRA validation simulation
-		// This is necessary because DRA allocator needs node information for:
-		// - NodeSelector matching in ResourceSlice selection
-		// - PerDeviceNodeSelection validation
-		// - Generating proper AllocationResult.NodeSelector
 		placeholderNode := n.createPlaceholderNode(it)
 
-		// Validate if this instance type can accommodate both existing and new claims
-		canSchedule, err := n.draValidator.CanScheduleWithDRA(
+		// Use the high-level SchedulePodWithDRA method
+		// For inflight NodeClaims, we pass n.draAllocationResults as cachedResults
+		canSchedule, allocationResults, err := n.draValidator.SchedulePodWithDRA(
 			ctx,
-			existingClaims,
-			newPodClaims.Claims,
-			resourceSlices,
-			placeholderNode, // Use placeholder node avoid dra validation failed
+			pod,                     // newPod: the pod being scheduled
+			n.Pods,                  // existingPods: pods already on this NodeClaim
+			n.draAllocationResults,  // cachedResults: cached allocation results
+			it.Name,                 // instanceType: the instance type being validated
+			placeholderNode,         // node: placeholder node for simulation
+			n.draManager,            // draManager: provides ResourceSlices
 		)
 		if err != nil {
 			return nil, fmt.Errorf("DRA validation failed for instance type %s: %w", it.Name, err)
 		}
 
 		if canSchedule {
+			// Cache the allocation results for this pod
+			// This ensures that if this pod is added to the NodeClaim, future CanAdd calls
+			// will use these same allocation results instead of re-allocating
+			n.draAllocationResults[pod] = allocationResults
 			compatible = append(compatible, it)
 		}
 	}

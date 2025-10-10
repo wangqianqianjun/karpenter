@@ -27,7 +27,7 @@ import (
 func TestDRAValidator_CanScheduleWithDRA_NoClaims(t *testing.T) {
 	validator := NewDRAValidator(fake.NewClientBuilder().Build())
 
-	canSchedule, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, nil)
+	canSchedule, _, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestDRAValidator_CanScheduleWithDRA_ClaimsButNoSlices(t *testing.T) {
 		},
 	}
 
-	canSchedule, err := validator.CanScheduleWithDRA(context.Background(), nil, claims, nil, nil)
+	canSchedule, _, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, claims, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestDRAValidator_CanScheduleWithDRA_SimpleMatch(t *testing.T) {
 		},
 	}
 
-	canSchedule, err := validator.CanScheduleWithDRA(context.Background(), nil, claims, slices, nil)
+	canSchedule, _, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, claims, slices, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestDRAValidator_CanScheduleWithDRA_InsufficientDevices(t *testing.T) {
 		},
 	}
 
-	canSchedule, err := validator.CanScheduleWithDRA(context.Background(), nil, claims, slices, nil)
+	canSchedule, _, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, claims, slices, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestDRAValidator_CanScheduleWithDRA_MissingDeviceClass(t *testing.T) {
 		},
 	}
 
-	canSchedule, err := validator.CanScheduleWithDRA(context.Background(), nil, claims, slices, nil)
+	canSchedule, _, err := validator.CanScheduleWithDRA(context.Background(), nil, nil, nil, claims, slices, nil)
 	if err == nil {
 		t.Error("expected error when DeviceClass is missing, got nil")
 	}
