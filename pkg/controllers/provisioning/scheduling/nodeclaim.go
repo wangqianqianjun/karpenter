@@ -64,16 +64,27 @@ type NodeClaim struct {
 	draManager   *DRAResourceManager
 	draValidator *scheduling.DRAValidator
 
-	// draAllocationResults caches allocation results for each pod scheduled to this NodeClaim.
-	// This ensures allocation stability - once a pod's devices are allocated, they won't change
-	// even if the allocator is called again (which could select different devices).
+	// draAllocationResults caches allocation results per pod per instance type.
+	// This ensures allocation stability - once a pod's devices are allocated for a specific
+	// instance type, they won't change even if the allocator is called again.
 	//
-	// Key: pod pointer (stable within a single scheduling cycle)
-	// Value: allocation results for the pod's resource claims
+	// We need TWO dimensions because:
+	// 1. Multiple instance types may satisfy a pod's DRA requirements
+	// 2. Each instance type may have different device pools/allocations
+	// 3. We don't know which instance type will be selected until later
+	//
+	// Structure:
+	//   First key: pod pointer (stable within a single scheduling cycle)
+	//   Second key: instance type name (e.g., "gpu-small", "gpu-medium")
+	//   Value: allocation results for that pod on that instance type
+	//
+	// Example:
+	//   draAllocationResults[pod1]["gpu-small"] = [device-0, device-1]
+	//   draAllocationResults[pod1]["gpu-medium"] = [device-3]
 	//
 	// Lifecycle: Created with NodeClaim, garbage collected when NodeClaim is discarded.
 	// No manual cleanup needed as NodeClaim is a single-use object per scheduling cycle.
-	draAllocationResults map[*corev1.Pod][]resourcev1.AllocationResult
+	draAllocationResults map[*corev1.Pod]map[string][]resourcev1.AllocationResult
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -126,7 +137,7 @@ func NewNodeClaim(
 		reservedOfferingMode: reservedOfferingMode,
 		draManager:           draManager,
 		draValidator:         draValidator,
-		draAllocationResults: make(map[*corev1.Pod][]resourcev1.AllocationResult),
+		draAllocationResults: make(map[*corev1.Pod]map[string][]resourcev1.AllocationResult),
 	}
 }
 
@@ -188,26 +199,34 @@ func (n *NodeClaim) filterInstanceTypesByDRA(
 		// Create a placeholder node for DRA validation simulation
 		placeholderNode := n.createPlaceholderNode(it)
 
+		// Build cached results for this specific instance type
+		// This extracts only the allocation results relevant to this instance type
+		// from the two-dimensional cache [pod][instanceType] -> results
+		cachedResultsForIT := scheduling.BuildCachedResultsForInstanceType(n.draAllocationResults, it.Name)
+
 		// Use the high-level SchedulePodWithDRA method
-		// For inflight NodeClaims, we pass n.draAllocationResults as cachedResults
+		// For inflight NodeClaims, we pass instance-type-specific cached results
 		canSchedule, allocationResults, err := n.draValidator.SchedulePodWithDRA(
 			ctx,
-			pod,                     // newPod: the pod being scheduled
-			n.Pods,                  // existingPods: pods already on this NodeClaim
-			n.draAllocationResults,  // cachedResults: cached allocation results
-			it.Name,                 // instanceType: the instance type being validated
-			placeholderNode,         // node: placeholder node for simulation
-			n.draManager,            // draManager: provides ResourceSlices
+			pod,                // newPod: the pod being scheduled
+			n.Pods,             // existingPods: pods already on this NodeClaim
+			cachedResultsForIT, // cachedResults: cached results for THIS instance type only
+			it.Name,            // instanceType: the instance type being validated
+			placeholderNode,    // node: placeholder node for simulation
+			n.draManager,       // draManager: provides ResourceSlices
 		)
 		if err != nil {
 			return nil, fmt.Errorf("DRA validation failed for instance type %s: %w", it.Name, err)
 		}
 
 		if canSchedule {
-			// Cache the allocation results for this pod
-			// This ensures that if this pod is added to the NodeClaim, future CanAdd calls
-			// will use these same allocation results instead of re-allocating
-			n.draAllocationResults[pod] = allocationResults
+			// Cache the allocation results for this pod + instance type combination
+			// This ensures that if this pod is added to the NodeClaim with this instance type,
+			// future CanAdd calls will use these same allocation results instead of re-allocating
+			if n.draAllocationResults[pod] == nil {
+				n.draAllocationResults[pod] = make(map[string][]resourcev1.AllocationResult)
+			}
+			n.draAllocationResults[pod][it.Name] = allocationResults
 			compatible = append(compatible, it)
 		}
 	}

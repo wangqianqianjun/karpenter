@@ -315,9 +315,9 @@ func (v *DRAValidator) SchedulePodWithDRA(
 	// Validate if this node can accommodate both existing and new claims
 	canSchedule, allocationResults, err := v.CanScheduleWithDRA(
 		ctx,
-		existingClaims,  // nil for inflight NodeClaims, populated for existing nodes
-		cachedResults,   // nil for existing nodes, populated for inflight NodeClaims
-		existingPods,    // used when cachedResults is not nil
+		existingClaims, // nil for inflight NodeClaims, populated for existing nodes
+		cachedResults,  // nil for existing nodes, populated for inflight NodeClaims
+		existingPods,   // used when cachedResults is not nil
 		newPodClaims.Claims,
 		resourceSlices,
 		node,
@@ -327,40 +327,6 @@ func (v *DRAValidator) SchedulePodWithDRA(
 	}
 
 	return canSchedule, allocationResults, nil
-}
-
-// ValidateNodeForPod is a backward-compatible wrapper around SchedulePodWithDRA
-// for existing node scenario. It returns an error if validation fails.
-//
-// Deprecated: Use SchedulePodWithDRA for more flexible control.
-func (v *DRAValidator) ValidateNodeForPod(
-	ctx context.Context,
-	newPod *corev1.Pod,
-	existingPods []*corev1.Pod,
-	instanceType string,
-	node *corev1.Node,
-	draManager interface {
-		GetResourceSlices(instanceType string) []resourcev1.ResourceSliceSpec
-	},
-) error {
-	canSchedule, _, err := v.SchedulePodWithDRA(
-		ctx,
-		newPod,
-		existingPods,
-		nil,  // cachedResults: nil for existing nodes
-		instanceType,
-		node,
-		draManager,
-	)
-	if err != nil {
-		return err
-	}
-
-	if !canSchedule {
-		return fmt.Errorf("node does not satisfy DRA requirements")
-	}
-
-	return nil
 }
 
 // buildAllocatedState creates an AllocatedState from existing claims
@@ -575,4 +541,38 @@ func NewDRAAllocator(
 		slices,
 		celCache,
 	)
+}
+
+// BuildCachedResultsForInstanceType extracts cached allocation results for a specific instance type
+// from a two-dimensional cache structure (pod -> instance type -> results).
+//
+// This is used in NodeClaim scheduling where we need to track allocation results per pod per instance type,
+// since multiple instance types may be compatible and we don't know which one will be selected until later.
+//
+// Parameters:
+//   - allCachedResults: two-dimensional map [pod][instanceType] -> AllocationResults
+//   - instanceTypeName: the specific instance type to extract results for
+//
+// Returns:
+//   - A flat map [pod] -> AllocationResults containing only the results for the specified instance type
+func BuildCachedResultsForInstanceType(
+	allCachedResults map[*corev1.Pod]map[string][]resourcev1.AllocationResult,
+	instanceTypeName string,
+) map[*corev1.Pod][]resourcev1.AllocationResult {
+	if allCachedResults == nil {
+		return nil
+	}
+
+	result := make(map[*corev1.Pod][]resourcev1.AllocationResult)
+	for pod, perInstanceType := range allCachedResults {
+		if results, exists := perInstanceType[instanceTypeName]; exists {
+			result[pod] = results
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
 }
