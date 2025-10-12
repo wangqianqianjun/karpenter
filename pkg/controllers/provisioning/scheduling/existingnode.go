@@ -112,21 +112,33 @@ func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData
 	nodeRequirements.Add(topologyRequirements.Values()...)
 
 	// Check DRA (Dynamic Resource Allocation) requirements if pod has resource claims
-	if n.draManager != nil && n.draValidator != nil {
-		// Get instance type from node labels
-		instanceType := n.Labels()[v1.LabelInstanceTypeStable]
-		if instanceType == "" && len(pod.Spec.ResourceClaims) > 0 {
-			return nil, fmt.Errorf("node missing instance-type label")
+	if n.draManager != nil && n.draValidator != nil && len(pod.Spec.ResourceClaims) > 0 {
+		// For existing nodes: query REAL ResourceSlices from the cluster
+		resourceSlices, err := n.draValidator.GetNodeResourceSlices(ctx, n.Node.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ResourceSlices for node %s: %w", n.Node.Name, err)
 		}
 
-		// Validate DRA requirements using SchedulePodWithDRA
+		// If node has no ResourceSlices but pod requires DRA, cannot schedule
+		if len(resourceSlices) == 0 {
+			return nil, fmt.Errorf("node %s has no DRA ResourceSlices, cannot schedule pod with resource claims", n.Node.Name)
+		}
+
+		// Validate DRA requirements using REAL ResourceSlices
 		// For existing nodes, pass nil for cachedResults
-		canSchedule, _, err := n.draValidator.SchedulePodWithDRA(ctx, pod, n.Pods, nil, instanceType, n.Node, n.draManager)
+		canSchedule, _, err := n.draValidator.SchedulePodWithDRA(
+			ctx,
+			pod,
+			n.Pods,
+			nil,             // No cached results for existing nodes
+			resourceSlices,  // Use REAL ResourceSlices from cluster
+			n.Node,
+		)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("DRA validation failed: %w", err)
 		}
 		if !canSchedule {
-			return nil, fmt.Errorf("DRA validation failed")
+			return nil, fmt.Errorf("DRA validation failed: insufficient DRA resources")
 		}
 	}
 

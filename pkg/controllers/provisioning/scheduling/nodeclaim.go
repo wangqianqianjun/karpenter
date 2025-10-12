@@ -204,6 +204,10 @@ func (n *NodeClaim) filterInstanceTypesByDRA(
 		// from the two-dimensional cache [pod][instanceType] -> results
 		cachedResultsForIT := scheduling.BuildCachedResultsForInstanceType(n.draAllocationResults, it.Name)
 
+		// Get VIRTUAL ResourceSlices for this instance type from NodeOverlay
+		// For inflight NodeClaims, we use virtual ResourceSlices since the node doesn't exist yet
+		resourceSlices := n.draManager.GetResourceSlices(it.Name)
+
 		// Use the high-level SchedulePodWithDRA method
 		// For inflight NodeClaims, we pass instance-type-specific cached results
 		canSchedule, allocationResults, err := n.draValidator.SchedulePodWithDRA(
@@ -211,9 +215,8 @@ func (n *NodeClaim) filterInstanceTypesByDRA(
 			pod,                // newPod: the pod being scheduled
 			n.Pods,             // existingPods: pods already on this NodeClaim
 			cachedResultsForIT, // cachedResults: cached results for THIS instance type only
-			it.Name,            // instanceType: the instance type being validated
+			resourceSlices,     // resourceSlices: VIRTUAL ResourceSlices from NodeOverlay
 			placeholderNode,    // node: placeholder node for simulation
-			n.draManager,       // draManager: provides ResourceSlices
 		)
 		if err != nil {
 			return nil, fmt.Errorf("DRA validation failed for instance type %s: %w", it.Name, err)

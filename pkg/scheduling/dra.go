@@ -257,17 +257,16 @@ func (v *DRAValidator) CanScheduleWithDRA(
 // for scheduling a pod to either an existing node or an inflight NodeClaim.
 //
 // This unified method supports two scenarios:
-// 1. Existing nodes: Uses existingClaims from ResourceClaim.Status.Allocation
-// 2. Inflight NodeClaims: Uses cachedResults from previous allocations
+// 1. Existing nodes: Uses existingClaims from ResourceClaim.Status.Allocation + REAL ResourceSlices
+// 2. Inflight NodeClaims: Uses cachedResults from previous allocations + VIRTUAL ResourceSlices
 //
 // Parameters:
 //   - ctx: context for API calls and logging
 //   - newPod: the pod being scheduled
 //   - existingPods: pods already scheduled on the node/NodeClaim
 //   - cachedResults: cached allocation results (for inflight NodeClaims, nil for existing nodes)
-//   - instanceType: the instance type of the node
+//   - resourceSlices: available ResourceSlices (REAL for existing nodes, VIRTUAL for inflight NodeClaims)
 //   - node: the actual node object (can be nil for simulation)
-//   - draManager: manager for looking up ResourceSlices by instance type
 //
 // Returns:
 //   - canSchedule: true if the pod can be scheduled
@@ -278,11 +277,8 @@ func (v *DRAValidator) SchedulePodWithDRA(
 	newPod *corev1.Pod,
 	existingPods []*corev1.Pod,
 	cachedResults map[*corev1.Pod][]resourcev1.AllocationResult,
-	instanceType string,
+	resourceSlices []resourcev1.ResourceSliceSpec,
 	node *corev1.Node,
-	draManager interface {
-		GetResourceSlices(instanceType string) []resourcev1.ResourceSliceSpec
-	},
 ) (bool, []resourcev1.AllocationResult, error) {
 	// Check if pod has resource claims
 	if len(newPod.Spec.ResourceClaims) == 0 {
@@ -294,9 +290,6 @@ func (v *DRAValidator) SchedulePodWithDRA(
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to get resource claims for pod: %w", err)
 	}
-
-	// Get ResourceSlices for this instance type
-	resourceSlices := draManager.GetResourceSlices(instanceType)
 
 	// For existing nodes: collect existingClaims from Status.Allocation
 	// For inflight NodeClaims: existingClaims will be nil, use cachedResults instead
@@ -504,6 +497,40 @@ func (l *KubeDeviceClassLister) Get(name string) (*resourcev1.DeviceClass, error
 		return nil, fmt.Errorf("failed to get device class %s: %w", name, err)
 	}
 	return &deviceClass, nil
+}
+
+// GetNodeResourceSlices queries real ResourceSlices from the cluster for a specific node.
+// This is used for existing nodes where we need to match against real device allocations.
+//
+// IMPORTANT: This method requires a field index on ResourceSlice.spec.nodeName to be set up
+// during operator initialization. Without the index, this query will be inefficient.
+//
+// Returns:
+//   - ResourceSliceSpecs for the node
+//   - error if query fails
+func (v *DRAValidator) GetNodeResourceSlices(ctx context.Context, nodeName string) ([]resourcev1.ResourceSliceSpec, error) {
+	var sliceList resourcev1.ResourceSliceList
+
+	// Query ResourceSlices where spec.nodeName matches the node name
+	// Note: This requires the field index "spec.nodeName" to be set up
+	if err := v.kubeClient.List(ctx, &sliceList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		return nil, fmt.Errorf("failed to list ResourceSlices for node %s: %w", nodeName, err)
+	}
+
+	if len(sliceList.Items) == 0 {
+		// Node has no ResourceSlices - this is normal for nodes without DRA resources
+		log.FromContext(ctx).WithValues("node", nodeName).V(2).Info("node has no ResourceSlices")
+		return nil, nil
+	}
+
+	// Convert to specs
+	specs := make([]resourcev1.ResourceSliceSpec, len(sliceList.Items))
+	for i, slice := range sliceList.Items {
+		specs[i] = slice.Spec
+	}
+
+	log.FromContext(ctx).WithValues("node", nodeName, "sliceCount", len(specs)).V(2).Info("retrieved ResourceSlices for node")
+	return specs, nil
 }
 
 // GetDRAFeatures returns the structured.Features to use for DRA allocation.
